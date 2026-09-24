@@ -1,0 +1,12 @@
+node_modules/
+dist/
+work/
+.env
+.env.*
+!.env.example
+*.tgz
+.DS_Store
+.wrangler/
+.dev.vars
+wrangler.private.json
+.dev.vars.*
