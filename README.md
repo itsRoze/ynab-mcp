@@ -78,7 +78,7 @@ The YNAB token stays on the server. Sign in using a separate generated connector
 
 Amounts use exact decimal strings in your plan's currency. Budget changes check fresh assignments before writing, and transaction creation supports retry deduplication. Client permissions still apply; the server itself does not add a confirmation dialog.
 
-**Know the limits:** moving money requires two YNAB writes and can partially succeed. An uncertain write is never automatically retried. Avoid simultaneous edits across clients and the YNAB app. Transaction deletion, split editing, scheduled-transaction editing, and advanced target cadence editing are not supported.
+**Know the limits:** moving money requires two YNAB writes and can partially succeed. An uncertain write is never automatically retried. Avoid simultaneous edits across clients and the YNAB app. Transaction deletion, editing existing splits, scheduled-transaction editing, and advanced target cadence editing are not supported.
 
 ## Privacy
 

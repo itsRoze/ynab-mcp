@@ -17,8 +17,8 @@
 | `list_scheduled_transactions` | Upcoming and recurring bills |
 | `set_category_budget` | Set a category's absolute monthly assigned total |
 | `move_category_money` | Move available money between categories |
-| `create_transaction` | Record an inflow or outflow with retry deduplication |
-| `update_transaction` | Recategorize, edit, approve or clear a transaction |
+| `create_transaction` | Record an inflow or outflow, optionally as a split, with retry deduplication |
+| `update_transaction` | Recategorize, edit, approve or clear a transaction; split an unsplit transaction |
 | `update_category` | Change name, note or target amount; remove a target |
 
 The five mutation tools are marked as writes for host permission controls. The server instructions tell agents to act within the user's authorization; instructions and MCP annotations are not a separate approval mechanism.
@@ -33,9 +33,10 @@ The five mutation tools are marked as writes for host permission controls. The s
 - Transaction creation requires a stable `request_id`, hashed into an import ID. Reuse the same key for retries and a new key for a distinct intended transaction. YNAB treats these as imported transactions and may match an existing user-entered transaction. This does not guarantee deduplication against later bank imports that use different import IDs.
 - Write requests are never automatically retried. Network failures report an unknown outcome. Check fresh data before retrying.
 - Reads are cached in memory for 15 seconds; `fresh=true` bypasses the cache. Writes invalidate cached reads. A 429 response starts a cooldown. YNAB allows 200 requests per rolling hour per access token; multiple clients share this limit but do not share a local cache or cooldown.
+- Splits: `create_transaction` and `update_transaction` accept `subtransactions` (two or more parts, each with a signed decimal `amount` and optional `category_id`, `payee_id`/`payee_name` and `memo`). Parts must sum exactly to the parent amount, checked in milliunits before any write; the parent category is cleared. YNAB does not support changing the parts, amount, category or date of an existing split through its API, so those edits are refused, as is splitting a transfer.
 - Transaction pagination is local over the fetched date range. Responses disclose the total matching count and next offset. Category filtering includes parent transactions with a matching split: their parent amounts are not category-only spending totals. Pending bank transactions are excluded by YNAB.
 
-No transaction deletion, split editing/creation, scheduled-transaction editing, or advanced target cadence editing is exposed in this version. Use the YNAB UI for those tasks. `update_category` preserves existing target cadence when changing an amount; a new target uses YNAB defaults.
+No transaction deletion, editing of existing splits, scheduled-transaction editing, or advanced target cadence editing is exposed in this version. Use the YNAB UI for those tasks. `update_category` preserves existing target cadence when changing an amount; a new target uses YNAB defaults.
 
 ## Privacy
 

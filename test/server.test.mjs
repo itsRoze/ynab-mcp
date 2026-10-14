@@ -140,6 +140,53 @@ test('recategorization preserves omitted fields and refuses unsupported split ed
   assert.equal(requests.filter(r => r.method === 'PUT').length, 1);
 });
 
+test('update splits an unsplit transaction into exact milliunit parts', async t => {
+  const { call, requests } = await harness(t, req => ok({ transaction: req.method === 'GET'
+    ? { id: txId, amount: -4181590, category_id: null, subtransactions: [] }
+    : req.body.transaction }));
+  const result = await call('update_transaction', { plan_id: plan, transaction_id: txId, approved: true, subtransactions: [
+    { amount: '-3972', category_id: catA }, { amount: '-209.59', category_id: catB, memo: 'electric' },
+  ] });
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(requests.at(-1).body, { transaction: { approved: true, category_id: null, subtransactions: [
+    { amount: -3972000, category_id: catA }, { amount: -209590, category_id: catB, memo: 'electric' },
+  ] } });
+});
+
+test('split writes are refused when parts do not sum, a category is set, or the transaction is already split or a transfer', async t => {
+  let existing = { id: txId, amount: -10000, subtransactions: [] };
+  const { call, requests } = await harness(t, () => ok({ transaction: existing }));
+  const parts = [{ amount: '-6', category_id: catA }, { amount: '-4', category_id: catB }];
+  const args = { plan_id: plan, transaction_id: txId };
+  assert.match((await call('update_transaction', { ...args, subtransactions: [parts[0], { amount: '-3.99', category_id: catB }] })).content[0].text, /sum to -9.990/);
+  assert.equal((await call('update_transaction', { ...args, category_id: catA, subtransactions: parts })).isError, true);
+  assert.equal((await call('update_transaction', { ...args, subtransactions: [parts[0]] })).isError, true);
+  assert.equal((await call('update_transaction', { ...args, subtransactions: [parts[0], { amount: '0', category_id: catB }, { amount: '-4', category_id: catB }] })).isError, true);
+  existing = { ...existing, transfer_account_id: account };
+  assert.equal((await call('update_transaction', { ...args, subtransactions: parts })).isError, true);
+  existing = { id: txId, amount: -10000, subtransactions: [{ amount: -10000 }] };
+  assert.equal((await call('update_transaction', { ...args, subtransactions: parts })).isError, true);
+  assert.equal(requests.filter(r => r.method !== 'GET').length, 0);
+});
+
+test('update can split while also changing the parent amount', async t => {
+  const { call, requests } = await harness(t, req => ok({ transaction: req.method === 'GET' ? { id: txId, amount: -5000, subtransactions: [] } : req.body.transaction }));
+  await call('update_transaction', { plan_id: plan, transaction_id: txId, amount: '-10', subtransactions: [{ amount: '-6', category_id: catA }, { amount: '-4', category_id: catB }] });
+  assert.equal(requests.at(-1).body.transaction.amount, -10000);
+  assert.equal(requests.at(-1).body.transaction.subtransactions.length, 2);
+});
+
+test('create records a split and validates its total', async t => {
+  const { call, requests } = await harness(t, req => ok({ transaction: req.body.transaction }));
+  const args = { plan_id: plan, account_id: account, date: '2026-09-01', amount: '-10', payee_name: 'Market', request_id: 'split-1' };
+  assert.equal((await call('create_transaction', { ...args, subtransactions: [{ amount: '-6', category_id: catA }, { amount: '-5', category_id: catB }] })).isError, true);
+  assert.equal(requests.length, 0);
+  await call('create_transaction', { ...args, subtransactions: [{ amount: '-6', category_id: catA }, { amount: '-4', category_id: catB }] });
+  const body = requests[0].body.transaction;
+  assert.equal(body.category_id, null);
+  assert.deepEqual(body.subtransactions.map(s => s.amount), [-6000, -4000]);
+});
+
 test('transaction filtering includes splits and reports pagination explicitly', async t => {
   const { call } = await harness(t, req => {
     assert.ok(req.url.includes('since_date=2026-09-01'));
