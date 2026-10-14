@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { YnabApi } from './api.js';
-import { toMilliunits, withAmounts } from './money.js';
+import { fromMilliunits, toMilliunits, withAmounts } from './money.js';
 
 const id = z.string().uuid();
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(s => {
@@ -21,15 +21,31 @@ const transactionFields = {
   cleared: z.enum(['cleared', 'uncleared', 'reconciled']).optional(), approved: z.boolean().optional(),
   flag_color: z.enum(['red', 'orange', 'yellow', 'green', 'blue', 'purple']).nullable().optional(),
 };
+const subtransaction = z.object({
+  amount, category_id: id.nullable().optional(), memo: z.string().max(500).nullable().optional(),
+  payee_id: id.nullable().optional(), payee_name: z.string().max(200).nullable().optional(),
+}).strict();
+const subtransactions = z.array(subtransaction).min(2).max(100).optional()
+  .describe('Split into these parts. Amounts are signed like the parent and must sum exactly to the parent amount. Only for transactions that are not already split and are not transfers.');
 type Category = { id: string; name: string; budgeted: number; balance: number; activity: number; deleted?: boolean; hidden?: boolean; goal_under_funded?: number | null; [key: string]: unknown };
 type Transaction = { id: string; subtransactions?: unknown[]; [key: string]: unknown };
 const base = (planId: string) => `/plans/${planId}`;
 const categoryPath = (planId: string, m: string, categoryId: string) => `${base(planId)}/months/${m}/categories/${categoryId}`;
+type SubtransactionInput = z.infer<typeof subtransaction>;
 function transactionBody(fields: Record<string, unknown>) {
   const result = { ...fields };
   if (typeof result.amount === 'string') result.amount = toMilliunits(result.amount);
   if (result.payee_id && result.payee_name) throw new Error('Specify payee_id or payee_name, not both.');
   return result;
+}
+/** Validate a split exactly in milliunits; the parent category must be cleared for YNAB to store a split. */
+function splitBody(parts: SubtransactionInput[], parentAmount: number, parentCategory: unknown) {
+  if (parentCategory) throw new Error('Omit category_id (or pass null) when supplying subtransactions; each part carries its own category.');
+  const converted = parts.map(part => transactionBody(part) as Record<string, unknown> & { amount: number });
+  if (converted.some(p => p.amount === 0)) throw new Error('Each split part needs a non-zero amount.');
+  const total = converted.reduce((sum, p) => sum + p.amount, 0);
+  if (total !== parentAmount) throw new Error(`Split parts sum to ${fromMilliunits(total)} but the transaction amount is ${fromMilliunits(parentAmount)}. They must match exactly.`);
+  return converted;
 }
 
 export function createServer(api: YnabApi, options: { readOnly?: boolean } = {}) {
@@ -143,23 +159,32 @@ export function createServer(api: YnabApi, options: { readOnly?: boolean } = {})
         error: error instanceof Error ? error.message : 'Destination write failed.' };
     }
   });
-  tool('create_transaction', 'Record a transaction. Negative amount = spending, positive = income. request_id is a stable unique key for this intended transaction: REUSE on retry. It maps to YNAB import_id, so the transaction is imported and may match an existing user-entered transaction. No split creation.', {
-    ...plan, ...transactionFields, account_id: id, date, amount,
+  tool('create_transaction', 'Record a transaction. Negative amount = spending, positive = income. request_id is a stable unique key for this intended transaction: REUSE on retry. It maps to YNAB import_id, so the transaction is imported and may match an existing user-entered transaction. Pass subtransactions to record a split.', {
+    ...plan, ...transactionFields, account_id: id, date, amount, subtransactions,
     request_id: z.string().min(1).max(200).describe('Unique per intended transaction, stable across retries, e.g. a UUID.'),
   }, true, async a => {
-    const { plan_id, request_id, ...fields } = a;
+    const { plan_id, request_id, subtransactions: parts, ...fields } = a;
     const import_id = `mcp:${createHash('sha256').update(request_id).digest('hex').slice(0, 32)}`;
-    return api.request(`${base(plan_id)}/transactions`, { method: 'POST', body: { transaction: { ...transactionBody(fields), import_id } } });
+    const body: Record<string, unknown> = { ...transactionBody(fields), import_id };
+    if (parts) Object.assign(body, { category_id: null, subtransactions: splitBody(parts, body.amount as number, fields.category_id) });
+    return api.request(`${base(plan_id)}/transactions`, { method: 'POST', body: { transaction: body } });
   }, true);
-  tool('update_transaction', 'Edit supplied transaction fields only: recategorize, change memo/payee/date/amount, clear or approve. Read first. Split amount/category/date edits are rejected; use the YNAB UI for split edits.', {
-    ...plan, transaction_id: id, ...transactionFields,
+  tool('update_transaction', 'Edit supplied transaction fields only: recategorize, change memo/payee/date/amount, clear or approve. Read first. Pass subtransactions to split a transaction that is not already split (parts must sum to its amount). Editing an existing split\'s parts, amount, category or date is rejected; use the YNAB UI for that.', {
+    ...plan, transaction_id: id, ...transactionFields, subtransactions,
   }, true, async a => {
-    const { plan_id, transaction_id, ...fields } = a;
-    if (!Object.keys(fields).length) throw new Error('Supply at least one field to change.');
+    const { plan_id, transaction_id, subtransactions: parts, ...fields } = a;
+    if (!Object.keys(fields).length && !parts) throw new Error('Supply at least one field to change.');
     const path = `${base(plan_id)}/transactions/${transaction_id}`;
     const { transaction } = await api.request<{ transaction: Transaction }>(path, { fresh: true });
-    if (transaction.subtransactions?.length && ('amount' in fields || 'category_id' in fields || 'date' in fields)) throw new Error('Edit split category, amount or date in YNAB.');
-    return api.request(path, { method: 'PUT', body: { transaction: transactionBody(fields) } });
+    const alreadySplit = Boolean(transaction.subtransactions?.length);
+    if (alreadySplit && (parts || 'amount' in fields || 'category_id' in fields || 'date' in fields)) throw new Error('Edit split parts, category, amount or date in YNAB.');
+    const body = transactionBody(fields);
+    if (parts) {
+      if (transaction.transfer_account_id) throw new Error('Transfers cannot be split here; split in YNAB.');
+      const parentAmount = (body.amount as number | undefined) ?? (transaction.amount as number);
+      Object.assign(body, { category_id: null, subtransactions: splitBody(parts, parentAmount, fields.category_id) });
+    }
+    return api.request(path, { method: 'PUT', body: { transaction: body } });
   }, true);
   tool('update_category', 'Rename a category, edit its note, or set/remove a target amount. Omitted fields stay unchanged. goal_target=null removes the target; a new target uses YNAB defaults. Use YNAB for advanced target cadence.', {
     ...plan, category_id: id, name: z.string().min(1).max(200).optional(), note: z.string().max(500).nullable().optional(), goal_target: amount.nullable().optional(),
